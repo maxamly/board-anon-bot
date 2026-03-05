@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Optional, cast
+import json
+from typing import Any, Optional
 
 from slugify import slugify
-from sqlmodel import Session, select
+from sqlmodel import Session, and_, col, desc, func, select
 
 from app.db.models import (
     AdminRole,
@@ -53,11 +54,10 @@ class Repository:
 
     def list_boards(self, include_archived: bool = True) -> list[Board]:
         statement = select(Board)
-        statement = statement.order_by(Board.title)
-        boards = list(self.session.exec(statement).all())
-        if include_archived:
-            return boards
-        return [board for board in boards if board.is_active]
+        if not include_archived:
+            statement = statement.where(col(Board.is_active).is_(True))
+        statement = statement.order_by(col(Board.title))
+        return list(self.session.exec(statement).all())
 
     def get_board(self, board_id: int | None) -> Optional[Board]:
         if board_id is None:
@@ -74,7 +74,7 @@ class Repository:
         base_slug = slugify(title) or "board"
         slug = base_slug
         counter = 2
-        while self.session.exec(select(Board).where(Board.slug == slug)).first() is not None:
+        while self.session.exec(select(Board).where(col(Board.slug) == slug)).first() is not None:
             slug = f"{base_slug}-{counter}"
             counter += 1
 
@@ -132,8 +132,8 @@ class Repository:
     def ensure_membership(self, user_id: int, board_id: int | None) -> BoardMembership:
         board_id = self._require_board_id(board_id)
         statement = select(BoardMembership).where(
-            BoardMembership.user_id == user_id,
-            BoardMembership.board_id == board_id,
+            col(BoardMembership.user_id) == user_id,
+            col(BoardMembership.board_id) == board_id,
         )
         membership = self.session.exec(statement).first()
         if membership is None:
@@ -154,14 +154,12 @@ class Repository:
             return None
 
         statement = select(Post).where(
-            Post.user_id == user_id,
-            Post.board_id == board_id,
-            cast(Any, Post.is_archived).is_(False),
+            col(Post.user_id) == user_id,
+            col(Post.board_id) == board_id,
+            col(Post.is_archived).is_(False),
         )
-        posts = list(self.session.exec(statement).all())
-        if not posts:
-            return None
-        return max(posts, key=lambda item: item.posted_at)
+        statement = statement.order_by(desc(col(Post.posted_at))).limit(1)
+        return self.session.exec(statement).first()
 
     def archive_post(self, post: Post) -> Post:
         post.is_archived = True
@@ -181,8 +179,8 @@ class Repository:
         if user_id in bootstrap_superadmins:
             return True
         statement = select(AdminRole).where(
-            AdminRole.user_id == user_id,
-            AdminRole.role == ROLE_SUPERADMIN,
+            col(AdminRole.user_id) == user_id,
+            col(AdminRole.role) == ROLE_SUPERADMIN,
         )
         return self.session.exec(statement).first() is not None
 
@@ -192,23 +190,50 @@ class Repository:
         if self.is_superadmin(user_id=user_id, bootstrap_superadmins=bootstrap_superadmins):
             return True
         statement = select(AdminRole).where(
-            AdminRole.user_id == user_id,
-            AdminRole.board_id == board_id,
-            AdminRole.role == ROLE_BOARD_ADMIN,
+            col(AdminRole.user_id) == user_id,
+            col(AdminRole.board_id) == board_id,
+            col(AdminRole.role) == ROLE_BOARD_ADMIN,
         )
         return self.session.exec(statement).first() is not None
 
     def is_any_admin(self, user_id: int, bootstrap_superadmins: set[int]) -> bool:
         if self.is_superadmin(user_id=user_id, bootstrap_superadmins=bootstrap_superadmins):
             return True
-        statement = select(AdminRole).where(AdminRole.user_id == user_id)
+        statement = select(AdminRole).where(col(AdminRole.user_id) == user_id)
         return self.session.exec(statement).first() is not None
+
+    def list_manageable_boards(
+        self,
+        user_id: int,
+        bootstrap_superadmins: set[int],
+        *,
+        include_archived: bool = False,
+    ) -> list[Board]:
+        if self.is_superadmin(user_id=user_id, bootstrap_superadmins=bootstrap_superadmins):
+            return self.list_boards(include_archived=include_archived)
+
+        statement = (
+            select(Board)
+            .join(
+                AdminRole,
+                and_(
+                    col(AdminRole.board_id) == col(Board.id),
+                    col(AdminRole.user_id) == user_id,
+                    col(AdminRole.role) == ROLE_BOARD_ADMIN,
+                ),
+            )
+            .distinct()
+        )
+        if not include_archived:
+            statement = statement.where(col(Board.is_active).is_(True))
+        statement = statement.order_by(col(Board.title))
+        return list(self.session.exec(statement).all())
 
     def grant_superadmin(self, user_id: int) -> AdminRole:
         statement = select(AdminRole).where(
-            AdminRole.user_id == user_id,
-            AdminRole.role == ROLE_SUPERADMIN,
-            cast(Any, AdminRole.board_id).is_(None),
+            col(AdminRole.user_id) == user_id,
+            col(AdminRole.role) == ROLE_SUPERADMIN,
+            col(AdminRole.board_id).is_(None),
         )
         role = self.session.exec(statement).first()
         if role is not None:
@@ -221,9 +246,9 @@ class Repository:
     def grant_board_admin(self, user_id: int, board_id: int | None) -> AdminRole:
         board_id = self._require_board_id(board_id)
         statement = select(AdminRole).where(
-            AdminRole.user_id == user_id,
-            AdminRole.board_id == board_id,
-            AdminRole.role == ROLE_BOARD_ADMIN,
+            col(AdminRole.user_id) == user_id,
+            col(AdminRole.board_id) == board_id,
+            col(AdminRole.role) == ROLE_BOARD_ADMIN,
         )
         role = self.session.exec(statement).first()
         if role is not None:
@@ -235,9 +260,9 @@ class Repository:
 
     def revoke_superadmin(self, user_id: int) -> int:
         statement = select(AdminRole).where(
-            AdminRole.user_id == user_id,
-            AdminRole.role == ROLE_SUPERADMIN,
-            cast(Any, AdminRole.board_id).is_(None),
+            col(AdminRole.user_id) == user_id,
+            col(AdminRole.role) == ROLE_SUPERADMIN,
+            col(AdminRole.board_id).is_(None),
         )
         roles = list(self.session.exec(statement).all())
         for role in roles:
@@ -249,9 +274,9 @@ class Repository:
         if board_id is None:
             return 0
         statement = select(AdminRole).where(
-            AdminRole.user_id == user_id,
-            AdminRole.role == ROLE_BOARD_ADMIN,
-            AdminRole.board_id == board_id,
+            col(AdminRole.user_id) == user_id,
+            col(AdminRole.role) == ROLE_BOARD_ADMIN,
+            col(AdminRole.board_id) == board_id,
         )
         roles = list(self.session.exec(statement).all())
         for role in roles:
@@ -270,7 +295,7 @@ class Repository:
     ) -> AuditLog:
         metadata_json = None
         if metadata:
-            metadata_json = str(metadata)
+            metadata_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
 
         item = AuditLog(
             actor_user_id=actor_user_id,
@@ -285,13 +310,18 @@ class Repository:
         return item
 
     def stats(self) -> dict[str, int]:
-        boards = self.list_boards(include_archived=True)
-        posts = list(self.session.exec(select(Post)).all())
-
         return {
-            "users": len(self.session.exec(select(User.id)).all()),
-            "boards_total": len(boards),
-            "boards_active": len([board for board in boards if board.is_active]),
-            "posts_total": len(posts),
-            "posts_active": len([post for post in posts if not post.is_archived]),
+            "users": int(self.session.exec(select(func.count()).select_from(User)).one()),
+            "boards_total": int(self.session.exec(select(func.count()).select_from(Board)).one()),
+            "boards_active": int(
+                self.session.exec(
+                    select(func.count()).select_from(Board).where(col(Board.is_active).is_(True))
+                ).one()
+            ),
+            "posts_total": int(self.session.exec(select(func.count()).select_from(Post)).one()),
+            "posts_active": int(
+                self.session.exec(
+                    select(func.count()).select_from(Post).where(col(Post.is_archived).is_(False))
+                ).one()
+            ),
         }

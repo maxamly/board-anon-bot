@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+
+from app.config import get_settings
 from sqlmodel import SQLModel, Session, create_engine
 
+from app.db.models import AuditLog
 from app.db.repositories import Repository
 
 
@@ -68,3 +72,52 @@ def test_single_active_post_archive_flow() -> None:
     assert active_after is not None
     assert active_after.id == second.id
     assert active_after.is_archived is False
+
+
+def test_manageable_boards_and_stats_are_scoped_in_db() -> None:
+    repo = make_repo()
+    repo.sync_user(1, "super", "S", None)
+    repo.sync_user(2, "moderator", "M", None)
+    board_a = repo.create_board("A", "@a", 120, 300)
+    board_b = repo.create_board("B", "@b", 120, 300)
+    repo.set_board_active(board_b.id, is_active=False)
+    repo.grant_board_admin(2, board_a.id)
+    repo.create_post(1, board_a.id, "hello", 101)
+
+    manageable = repo.list_manageable_boards(2, set())
+    stats = repo.stats()
+
+    assert [board.id for board in manageable] == [board_a.id]
+    assert stats == {
+        "users": 2,
+        "boards_total": 2,
+        "boards_active": 1,
+        "posts_total": 1,
+        "posts_active": 1,
+    }
+
+
+def test_audit_metadata_is_valid_json() -> None:
+    repo = make_repo()
+    repo.sync_user(1, "admin", "A", None)
+
+    item = repo.write_audit(
+        actor_user_id=1,
+        action="board_create",
+        target_type="board",
+        metadata={"title": "Board", "channel_id": "@board"},
+    )
+
+    stored = repo.session.get(AuditLog, item.id)
+    assert stored is not None
+    assert json.loads(stored.metadata_json or "{}") == {"channel_id": "@board", "title": "Board"}
+
+
+def test_settings_parse_comma_separated_superadmin_ids(monkeypatch) -> None:
+    monkeypatch.setenv("SUPERADMIN_IDS", "1, 2,3")
+    get_settings.cache_clear()
+
+    settings = get_settings()
+
+    assert settings.superadmin_ids == [1, 2, 3]
+    get_settings.cache_clear()

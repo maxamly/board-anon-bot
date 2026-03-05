@@ -5,11 +5,10 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from app.config import get_settings
-from app.db.repositories import Repository
-from app.db.session import session_scope
 from app.keyboards.user import board_picker_keyboard
 from app.locales.messages import t
 from app.services.posting import publish_text_post
+from app.services.scopes import user_service_scope
 
 router = Router(name="user")
 settings = get_settings()
@@ -19,19 +18,16 @@ async def _send_board_picker(message: Message, text: str) -> None:
     if message.from_user is None:
         return
 
-    with session_scope() as session:
-        repo = Repository(session)
-        user = repo.sync_user(
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name,
-        )
-        boards = repo.list_boards(include_archived=False)
-        selected = repo.get_user_selection(user.id)
+    with user_service_scope(message.from_user) as service:
+        board_picker = service.board_picker_view()
 
-    selected_id = selected.board_id if selected else None
-    await message.answer(text, reply_markup=board_picker_keyboard(boards, selected_board_id=selected_id))
+    await message.answer(
+        text,
+        reply_markup=board_picker_keyboard(
+            board_picker.boards,
+            selected_board_id=board_picker.selected_board_id,
+        ),
+    )
 
 
 @router.message(Command("start"))

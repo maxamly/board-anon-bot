@@ -6,8 +6,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from app.config import get_settings
-from app.db.repositories import Repository
-from app.db.session import session_scope
 from app.keyboards.admin import (
     admin_add_role_keyboard,
     admin_panel_keyboard,
@@ -15,7 +13,7 @@ from app.keyboards.admin import (
     board_action_keyboard,
 )
 from app.locales.messages import t
-from app.services.access import can_manage_board, is_any_admin, is_superadmin
+from app.services.scopes import admin_service_scope
 from app.states import (
     AdminAddStates,
     AdminRemoveStates,
@@ -33,15 +31,8 @@ async def _ensure_any_admin(message: Message) -> bool:
     if message.from_user is None:
         return False
 
-    with session_scope() as session:
-        repo = Repository(session)
-        repo.sync_user(
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name,
-        )
-        allowed = is_any_admin(repo, message.from_user.id, settings)
+    with admin_service_scope(message.from_user, settings) as service:
+        allowed = service.access.ensure_any_admin()
 
     if not allowed:
         await message.answer(t("admin_denied", locale=settings.default_locale))
@@ -53,15 +44,8 @@ async def _ensure_superadmin(message: Message) -> bool:
     if message.from_user is None:
         return False
 
-    with session_scope() as session:
-        repo = Repository(session)
-        repo.sync_user(
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name,
-        )
-        allowed = is_superadmin(repo, message.from_user.id, settings)
+    with admin_service_scope(message.from_user, settings) as service:
+        allowed = service.access.ensure_superadmin()
 
     if not allowed:
         await message.answer(t("admin_denied", locale=settings.default_locale))
@@ -82,12 +66,14 @@ async def admin_panel(message: Message) -> None:
 
 @router.message(Command("stats"))
 async def stats_command(message: Message) -> None:
+    if message.from_user is None:
+        return
+
     if not await _ensure_any_admin(message):
         return
 
-    with session_scope() as session:
-        repo = Repository(session)
-        data = repo.stats()
+    with admin_service_scope(message.from_user, settings) as service:
+        data = service.boards.stats()
 
     await message.answer(t("admin_stats", locale=settings.default_locale, **data))
 
@@ -109,9 +95,8 @@ async def board_archive_command(message: Message) -> None:
     if not await _ensure_superadmin(message):
         return
 
-    with session_scope() as session:
-        repo = Repository(session)
-        boards = [board for board in repo.list_boards(include_archived=False) if board.is_active]
+    with admin_service_scope(message.from_user, settings) as service:
+        boards = service.access.active_manageable_boards()
 
     if not boards:
         await message.answer(t("admin_no_boards", locale=settings.default_locale))
@@ -131,9 +116,8 @@ async def board_activate_command(message: Message) -> None:
     if not await _ensure_superadmin(message):
         return
 
-    with session_scope() as session:
-        repo = Repository(session)
-        boards = [board for board in repo.list_boards(include_archived=True) if not board.is_active]
+    with admin_service_scope(message.from_user, settings) as service:
+        boards = service.access.inactive_manageable_boards()
 
     if not boards:
         await message.answer(t("admin_no_boards", locale=settings.default_locale))
@@ -170,34 +154,13 @@ async def board_create_channel(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     title = data.get("title", "Новая доска")
 
-    with session_scope() as session:
-        repo = Repository(session)
-        admin_user = repo.sync_user(
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name,
-        )
-
-        if not is_superadmin(repo, admin_user.id, settings):
+    with admin_service_scope(message.from_user, settings) as service:
+        if not service.access.ensure_superadmin():
             await state.clear()
             await message.answer(t("admin_denied", locale=settings.default_locale))
             return
 
-        board = repo.create_board(
-            title=title,
-            channel_id=channel_id,
-            rate_limit_seconds=settings.default_rate_limit_seconds,
-            max_text_length=settings.default_max_text_length,
-        )
-        repo.write_audit(
-            actor_user_id=admin_user.id,
-            action="board_create",
-            target_type="board",
-            target_id=str(board.id),
-            board_id=board.id,
-            metadata={"title": board.title, "channel_id": board.channel_id},
-        )
+        board = service.boards.create_board(title=title, channel_id=channel_id)
         board_title = board.title
         board_id = board.id
 
@@ -260,15 +223,6 @@ async def admin_remove_user_id(message: Message, state: FSMContext) -> None:
     )
 
 
-def _manageable_boards(repo: Repository, admin_user_id: int) -> list:
-    boards = repo.list_boards(include_archived=False)
-    return [
-        board
-        for board in boards
-        if can_manage_board(repo, admin_user_id, board.id, settings)
-    ]
-
-
 @router.message(Command("block_user"))
 async def block_user_start(message: Message, state: FSMContext) -> None:
     if not await _ensure_any_admin(message):
@@ -290,9 +244,8 @@ async def block_user_choose_board(message: Message, state: FSMContext) -> None:
 
     target_user_id = int(raw)
 
-    with session_scope() as session:
-        repo = Repository(session)
-        boards = _manageable_boards(repo, message.from_user.id)
+    with admin_service_scope(message.from_user, settings) as service:
+        boards = service.access.manageable_boards()
 
     await state.clear()
     if not boards:
@@ -330,9 +283,8 @@ async def unblock_user_choose_board(message: Message, state: FSMContext) -> None
 
     target_user_id = int(raw)
 
-    with session_scope() as session:
-        repo = Repository(session)
-        boards = _manageable_boards(repo, message.from_user.id)
+    with admin_service_scope(message.from_user, settings) as service:
+        boards = service.access.manageable_boards()
 
     await state.clear()
     if not boards:
@@ -357,9 +309,8 @@ async def rate_limit_start(message: Message, state: FSMContext) -> None:
     if not await _ensure_any_admin(message):
         return
 
-    with session_scope() as session:
-        repo = Repository(session)
-        boards = _manageable_boards(repo, message.from_user.id)
+    with admin_service_scope(message.from_user, settings) as service:
+        boards = service.access.manageable_boards()
 
     if not boards:
         await message.answer(t("admin_no_boards", locale=settings.default_locale))
@@ -394,34 +345,17 @@ async def rate_limit_save(message: Message, state: FSMContext) -> None:
         await message.answer(t("board_not_found", locale=settings.default_locale))
         return
 
-    with session_scope() as session:
-        repo = Repository(session)
-        repo.sync_user(
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name,
-        )
-
-        if not can_manage_board(repo, message.from_user.id, board_id, settings):
+    with admin_service_scope(message.from_user, settings) as service:
+        if not service.access.can_manage_board(board_id):
             await state.clear()
             await message.answer(t("admin_denied", locale=settings.default_locale))
             return
 
-        board = repo.update_board_rate_limit(board_id=board_id, seconds=seconds)
+        board = service.boards.update_rate_limit(board_id=board_id, seconds=seconds)
         if board is None:
             await state.clear()
             await message.answer(t("board_not_found", locale=settings.default_locale))
             return
-
-        repo.write_audit(
-            actor_user_id=message.from_user.id,
-            action="board_rate_limit_update",
-            target_type="board",
-            target_id=str(board_id),
-            board_id=board_id,
-            metadata={"rate_limit_seconds": seconds},
-        )
 
     await state.clear()
     await message.answer(

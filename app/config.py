@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+from typing import Annotated
 from functools import lru_cache
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     bot_token: str = Field(default="", alias="BOT_TOKEN")
     database_url: str = Field(default="sqlite:///database.db", alias="DATABASE_URL")
-    superadmin_ids: list[int] = Field(default_factory=list, alias="SUPERADMIN_IDS")
+    superadmin_ids: Annotated[list[int], NoDecode] = Field(default_factory=list, alias="SUPERADMIN_IDS")
     default_rate_limit_seconds: int = Field(default=120, alias="DEFAULT_RATE_LIMIT_SECONDS")
     default_max_text_length: int = Field(default=300, alias="DEFAULT_MAX_TEXT_LENGTH")
     polling_timeout: int = Field(default=10, alias="POLLING_TIMEOUT")

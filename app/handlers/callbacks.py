@@ -6,12 +6,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from app.config import get_settings
-from app.db.repositories import Repository
-from app.db.session import session_scope
 from app.keyboards.admin import admin_board_actions_keyboard, admin_boards_keyboard, admin_panel_keyboard, board_action_keyboard
 from app.keyboards.user import board_picker_keyboard
 from app.locales.messages import t
-from app.services.access import can_manage_board, is_any_admin, is_superadmin
+from app.services.scopes import admin_service_scope, user_service_scope
 from app.states import RateLimitStates
 
 router = Router(name="callbacks")
@@ -71,28 +69,21 @@ async def user_select_board(callback: CallbackQuery) -> None:
 
     board_id = int(parts[0])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        user = repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-        board = repo.get_board(board_id)
-        if board is None or not board.is_active:
+    with user_service_scope(callback.from_user) as service:
+        board = service.select_board(board_id)
+        if board is None:
             await callback.answer(t("board_not_found", locale=settings.default_locale), show_alert=True)
             return
 
-        repo.set_user_selected_board(user_id=user.id, board_id=board.id)
-        repo.ensure_membership(user_id=user.id, board_id=board.id)
-
-        boards = repo.list_boards(include_archived=False)
+        board_picker = service.board_picker_view()
 
     await callback.answer()
-    await _safe_edit_text(message, 
+    await _safe_edit_text(message,
         t("board_selected", locale=settings.default_locale, title=board.title),
-        reply_markup=board_picker_keyboard(boards, selected_board_id=board.id),
+        reply_markup=board_picker_keyboard(
+            board_picker.boards,
+            selected_board_id=board_picker.selected_board_id,
+        ),
     )
 
 
@@ -102,15 +93,8 @@ async def admin_panel_home(callback: CallbackQuery) -> None:
     if callback.from_user is None or message is None:
         return
 
-    with session_scope() as session:
-        repo = Repository(session)
-        repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-        if not is_any_admin(repo, callback.from_user.id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.ensure_any_admin():
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
@@ -127,19 +111,12 @@ async def admin_panel_boards(callback: CallbackQuery) -> None:
     if callback.from_user is None or message is None:
         return
 
-    with session_scope() as session:
-        repo = Repository(session)
-        repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-        if not is_any_admin(repo, callback.from_user.id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.ensure_any_admin():
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        boards = repo.list_boards(include_archived=True)
+        boards = service.access.manageable_boards(include_archived=True)
 
     await callback.answer()
     if not boards:
@@ -158,19 +135,12 @@ async def admin_panel_stats(callback: CallbackQuery) -> None:
     if callback.from_user is None or message is None:
         return
 
-    with session_scope() as session:
-        repo = Repository(session)
-        repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-        if not is_any_admin(repo, callback.from_user.id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.ensure_any_admin():
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        data = repo.stats()
+        data = service.boards.stats()
 
     await callback.answer()
     await _safe_edit_text(message, t("admin_stats", locale=settings.default_locale, **data))
@@ -189,21 +159,13 @@ async def admin_board_details(callback: CallbackQuery) -> None:
 
     board_id = int(parts[0])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-
-        board = repo.get_board(board_id)
+    with admin_service_scope(callback.from_user, settings) as service:
+        board = service.boards.get_board(board_id)
         if board is None:
             await callback.answer(t("board_not_found", locale=settings.default_locale), show_alert=True)
             return
 
-        if not can_manage_board(repo, callback.from_user.id, board.id, settings):
+        if not service.access.can_manage_board(board.id):
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
@@ -238,31 +200,15 @@ async def admin_board_archive(callback: CallbackQuery) -> None:
 
     board_id = int(parts[0])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        actor = repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-
-        if not is_superadmin(repo, actor.id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.ensure_superadmin():
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        board = repo.set_board_active(board_id=board_id, is_active=False)
+        board = service.boards.archive_board(board_id=board_id)
         if board is None:
             await callback.answer(t("board_not_found", locale=settings.default_locale), show_alert=True)
             return
-
-        repo.write_audit(
-            actor_user_id=actor.id,
-            action="board_archive",
-            target_type="board",
-            target_id=str(board.id),
-            board_id=board.id,
-        )
 
     await callback.answer()
     await _safe_edit_text(message, 
@@ -284,31 +230,15 @@ async def admin_board_activate(callback: CallbackQuery) -> None:
 
     board_id = int(parts[0])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        actor = repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-
-        if not is_superadmin(repo, actor.id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.ensure_superadmin():
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        board = repo.set_board_active(board_id=board_id, is_active=True)
+        board = service.boards.activate_board(board_id=board_id)
         if board is None:
             await callback.answer(t("board_not_found", locale=settings.default_locale), show_alert=True)
             return
-
-        repo.write_audit(
-            actor_user_id=actor.id,
-            action="board_activate",
-            target_type="board",
-            target_id=str(board.id),
-            board_id=board.id,
-        )
 
     await callback.answer()
     await _safe_edit_text(message, 
@@ -329,26 +259,12 @@ async def admin_add_role_super(callback: CallbackQuery) -> None:
 
     target_user_id = int(parts[0])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        actor = repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-
-        if not is_superadmin(repo, actor.id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.ensure_superadmin():
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        repo.grant_superadmin(target_user_id)
-        repo.write_audit(
-            actor_user_id=actor.id,
-            action="grant_superadmin",
-            target_type="user",
-            target_id=str(target_user_id),
-        )
+        service.roles.grant_superadmin(target_user_id)
 
     await callback.answer(t("admin_role_granted", locale=settings.default_locale), show_alert=True)
 
@@ -366,19 +282,12 @@ async def admin_add_role_board_choose(callback: CallbackQuery) -> None:
 
     target_user_id = int(parts[0])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        actor = repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-        if not is_superadmin(repo, actor.id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.ensure_superadmin():
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        boards = repo.list_boards(include_archived=False)
+        boards = service.access.active_manageable_boards()
 
     await callback.answer()
     await _safe_edit_text(message, 
@@ -404,31 +313,15 @@ async def admin_add_role_board_save(callback: CallbackQuery) -> None:
     target_user_id = int(parts[0])
     board_id = int(parts[1])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        actor = repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-        if not is_superadmin(repo, actor.id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.ensure_superadmin():
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        board = repo.get_board(board_id)
+        board = service.roles.grant_board_admin(target_user_id=target_user_id, board_id=board_id)
         if board is None:
             await callback.answer(t("board_not_found", locale=settings.default_locale), show_alert=True)
             return
-
-        repo.grant_board_admin(user_id=target_user_id, board_id=board_id)
-        repo.write_audit(
-            actor_user_id=actor.id,
-            action="grant_board_admin",
-            target_type="user",
-            target_id=str(target_user_id),
-            board_id=board_id,
-        )
 
     await callback.answer(t("admin_role_granted", locale=settings.default_locale), show_alert=True)
 
@@ -445,25 +338,12 @@ async def admin_remove_role_super(callback: CallbackQuery) -> None:
 
     target_user_id = int(parts[0])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        actor = repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-        if not is_superadmin(repo, actor.id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.ensure_superadmin():
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        repo.revoke_superadmin(target_user_id)
-        repo.write_audit(
-            actor_user_id=actor.id,
-            action="revoke_superadmin",
-            target_type="user",
-            target_id=str(target_user_id),
-        )
+        service.roles.revoke_superadmin(target_user_id)
 
     await callback.answer(t("admin_role_removed", locale=settings.default_locale), show_alert=True)
 
@@ -481,18 +361,11 @@ async def admin_remove_role_board_choose(callback: CallbackQuery) -> None:
 
     target_user_id = int(parts[0])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        actor = repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-        if not is_superadmin(repo, actor.id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.ensure_superadmin():
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
-        boards = repo.list_boards(include_archived=True)
+        boards = service.access.manageable_boards(include_archived=True)
 
     await callback.answer()
     await _safe_edit_text(message, 
@@ -518,27 +391,12 @@ async def admin_remove_role_board_save(callback: CallbackQuery) -> None:
     target_user_id = int(parts[0])
     board_id = int(parts[1])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        actor = repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-
-        if not is_superadmin(repo, actor.id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.ensure_superadmin():
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        repo.revoke_board_admin(user_id=target_user_id, board_id=board_id)
-        repo.write_audit(
-            actor_user_id=actor.id,
-            action="revoke_board_admin",
-            target_type="user",
-            target_id=str(target_user_id),
-            board_id=board_id,
-        )
+        service.roles.revoke_board_admin(target_user_id=target_user_id, board_id=board_id)
 
     await callback.answer(t("admin_role_removed", locale=settings.default_locale), show_alert=True)
 
@@ -556,33 +414,15 @@ async def admin_block_user(callback: CallbackQuery) -> None:
     target_user_id = int(parts[0])
     board_id = int(parts[1])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        actor = repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-
-        if not can_manage_board(repo, actor.id, board_id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.can_manage_board(board_id):
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        board = repo.get_board(board_id)
+        board = service.moderation.block_user(target_user_id=target_user_id, board_id=board_id)
         if board is None:
             await callback.answer(t("board_not_found", locale=settings.default_locale), show_alert=True)
             return
-
-        repo.sync_user(user_id=target_user_id, username=None, first_name=None, last_name=None)
-        repo.set_membership_blocked(user_id=target_user_id, board_id=board_id, blocked=True)
-        repo.write_audit(
-            actor_user_id=actor.id,
-            action="block_user",
-            target_type="user",
-            target_id=str(target_user_id),
-            board_id=board_id,
-        )
 
     await callback.answer(
         t(
@@ -608,33 +448,15 @@ async def admin_unblock_user(callback: CallbackQuery) -> None:
     target_user_id = int(parts[0])
     board_id = int(parts[1])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        actor = repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-
-        if not can_manage_board(repo, actor.id, board_id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.can_manage_board(board_id):
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        board = repo.get_board(board_id)
+        board = service.moderation.unblock_user(target_user_id=target_user_id, board_id=board_id)
         if board is None:
             await callback.answer(t("board_not_found", locale=settings.default_locale), show_alert=True)
             return
-
-        repo.sync_user(user_id=target_user_id, username=None, first_name=None, last_name=None)
-        repo.set_membership_blocked(user_id=target_user_id, board_id=board_id, blocked=False)
-        repo.write_audit(
-            actor_user_id=actor.id,
-            action="unblock_user",
-            target_type="user",
-            target_id=str(target_user_id),
-            board_id=board_id,
-        )
 
     await callback.answer(
         t(
@@ -660,20 +482,12 @@ async def admin_rate_limit_choose_board(callback: CallbackQuery, state: FSMConte
 
     board_id = int(parts[0])
 
-    with session_scope() as session:
-        repo = Repository(session)
-        repo.sync_user(
-            user_id=callback.from_user.id,
-            username=callback.from_user.username,
-            first_name=callback.from_user.first_name,
-            last_name=callback.from_user.last_name,
-        )
-
-        if not can_manage_board(repo, callback.from_user.id, board_id, settings):
+    with admin_service_scope(callback.from_user, settings) as service:
+        if not service.access.can_manage_board(board_id):
             await callback.answer(t("admin_denied", locale=settings.default_locale), show_alert=True)
             return
 
-        board = repo.get_board(board_id)
+        board = service.boards.get_board(board_id)
         if board is None:
             await callback.answer(t("board_not_found", locale=settings.default_locale), show_alert=True)
             return
